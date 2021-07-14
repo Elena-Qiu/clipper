@@ -1,123 +1,249 @@
 from __future__ import print_function
-from clipper_admin import ClipperConnection, DockerContainerManager
-from clipper_admin.deployers import python as python_deployer
-import json
-from pandas.io.parsers import read_csv
-import requests
-import time
-import signal
+
 import sys
-import argparse
-from utils import *
-import asyncio
+import time
+import traceback
+import json
+import csv
 
 
-# Stop Clipper on Ctrl-C
-def signal_handler(signal, frame):
-    print("Stopping Clipper...")
-    clipper_conn = ClipperConnection(DockerContainerManager())
-    clipper_conn.stop_all()
-    sys.exit(0)
+def get_full_class_name(obj):
+    module = obj.__class__.__module__
+    if module is None or module == str.__class__.__module__:  # type: ignore
+        return obj.__class__.__name__
+    return module + '.' + obj.__class__.__name__
 
 
-async def sleep_func(inputs):
-    output = []
-    for input in inputs:
-        sleep_time = input[0]
-        start = time.perf_counter()
-        await asyncio.sleep(sleep_time/1000)
-        end = time.perf_counter()
-        output.append(str((end-start)*1000.0))
+def fake_model(batch):
+    '''Model runs inside clipper, not async'''
+    print('fake_model: serving batch', batch)
+
+    # the runtime of a batch is max(batch)
+    latency_ms = max(sample[0] for sample in batch)
+    # copy input to output
+    output = [str(sample[0]) for sample in batch]
+    time.sleep(latency_ms / 1000)
+
+    print('fake_model: returning', output)
     return output
 
 
-def predict(addr, x, batch=False):
-    url = "http://%s/random-sleep/predict" % (addr)
-    if batch:
-        req_json = json.dumps({'input_batch': x})
-    else:
-        req_json = json.dumps({'input': x})
-    headers = {'Content-type': 'application/json'}
-    start = time.perf_counter()
-    r = requests.post(url, headers=headers, data=req_json)
-    end = time.perf_counter()
-    latency = (end - start) * 1000.0
-    print("'%s', %f ms" % (r.text, latency))
-    return latency
+async def setup_clipper():
+    '''Setup the clipper cluster, returns the clipper connection and the endpoint url'''
+    import asyncio
+    import aiohttp
+    from clipper_admin import ClipperConnection, DockerContainerManager
+    from clipper_admin.exceptions import ClipperException
+    from clipper_admin.deployers import python as python_deployer
 
-
-async def queryer(req_df, durs, batch_size, output_file):
-    # deploy the model and register the application
-    signal.signal(signal.SIGINT, signal_handler)
     clipper_conn = ClipperConnection(DockerContainerManager(use_centralized_log=False))
-    clipper_conn.start_clipper()
-    python_deployer.create_endpoint(clipper_conn, "random-sleep", "floats",
-                            sleep_func, slo_micros=3000000)
 
-    # wait for the docker to initialize
-    await asyncio.sleep(6)
-
-    # insert one column of "Latency"
-    req_df.insert(2, "Latency", 0)
-
-    # define the fetch function
-    async def fetch(batch_id):
-        if batch_size > 1:
-            start_index = batch_id * batch_size
-            batch_df = req_df.iloc[start_index:(start_index+batch_size)]
-            input_list= [[row["Length"]] for _, row in batch_df.iterrows()]
-            latency = predict(clipper_conn.get_query_addr(), input_list, batch=True)
-            for idx in range(start_index, start_index+batch_size):
-                req_df.loc[idx, "Latency"] = latency
-        else:
-            input_list = [req_df.loc[batch_id, "Length"]]
-            latency = predict(clipper_conn.get_query_addr(), input_list, batch=False)
-            req_df.loc[batch_id, "Latency"] = latency
-
-    # start fetching
     try:
-        flying = []
-        for batch_id, dur in enumerate(durs):
-            start_time = time.perf_counter() * 1000
-            flying.append(asyncio.create_task(fetch(batch_id)))
-            _, pending = await asyncio.wait(flying, timeout=0)
-            flying = list(pending)
-            remaining_dur = dur - (time.perf_counter()*1000 - start_time)
-            if remaining_dur > 0:
-                await asyncio.sleep(remaining_dur/1000)
-            # else:
-            #     print("Duration between requests is too narrow ")
-        clipper_conn.stop_all()
-        req_df.to_csv(output_file)
-        pass
+        # start or connect to the cluster
+        try:
+            # this blocks until the cluster is ready
+            clipper_conn.start_clipper()
+        except ClipperException:
+            clipper_conn.connect()
+
+        # deploy the model and register the application
+        # this blocks until the model is ready
+        name = 'fake-model'
+        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=3000000)
+
+        # wait a few second for the model container to stablize
+        await asyncio.sleep(2)
+
+        retry = 3
+        # wait for replicas to spin up for 3s
+        while retry > 0:
+            if clipper_conn.get_num_replicas(name) > 0:
+                break
+            print('INFO: waiting for replicas to spin up', file=sys.stderr)
+            await asyncio.sleep(1)
+            retry -= 1
+        else:
+            # something wrong
+            print('ERROR: replicas take too long to spin up, possibly died. Check container log', file=sys.stderr)
+            raise TypeError('Bad python model')
+
+        # endpoint url
+        clipper_conn.get_query_addr()
+        endpoint = f"http://{clipper_conn.get_query_addr()}/fake-model/predict"
+
+        # wait for container to be ready
+        async with aiohttp.ClientSession() as http_client:
+            retry = 10
+            while retry > 0:
+                try:
+                    await predict(http_client, endpoint, 1.0)
+                    break
+                except:
+                    print('INFO: waiting for ready to serve', file=sys.stderr)
+                    await asyncio.sleep(1)
+                    retry -= 1
+            else:
+                # something wrong
+                print('ERROR: replicas take too long to spin up, possibly died. Check container log', file=sys.stderr)
+                raise TypeError('Bad python model')
+
+        print('INFO: ready to go', file=sys.stderr)
+
+        return clipper_conn, endpoint
     except Exception as e:
-        error = get_full_class_name(e)
-        print("Error: " + str(error))
+        # cleanup if error
+        print('ERROR: error when starting clipper, clean up', file=sys.stderr)
         clipper_conn.stop_all()
+        raise e
+
+
+async def predict(http_client, endpoint, length_ms):
+    async with http_client.post(endpoint, json={'input': [1.0]}) as r:
+        r = await r.json()
+        length_ms = float(r['output'])
+        return length_ms * 1000
+
+
+async def fetch(now_ms, length_ms, http_client, endpoint, args):
+    try:
+        if length_ms is not None:
+            print(f'INFO: at {now_ms:.3f} ms fetching {length_ms:.3f} ms', file=sys.stderr)
+        else:
+            print(f'INFO: at {now_ms:.3f} ms fetching None ms', file=sys.stderr)
+
+        started = time.perf_counter()
+        length_us = await predict(http_client, endpoint, length_ms)
+        # measured latency
+        latency_us = (time.perf_counter() - started) * 1000000
+        args.print(f'{now_ms},{length_us},{latency_us},done,')
+    except Exception as e:
+        ename = get_full_class_name(e)
+        if args.debug:
+            print('Error: ', traceback.format_exc(), file=sys.stderr)
+            raise e
+        args.print(f'{now_ms},,,error,{ename}')
+
+
+def incoming_file(filename: str):
+    """read delay and length from csv file
+    yields (delay_ms, length_ms)
+    """
+    with open(filename) as f:
+        reader = csv.DictReader(f)
+        jobs = [
+            (float(row['Admitted']), float(row['Length']))
+            for row in reader
+        ]
+    # jobs has to be sort by admitted
+    jobs.sort()
+    # take note of current time
+    now = 0
+    batch = []
+    for admitted, length_ms in jobs:
+        delay_ms = admitted - now
+        if delay_ms > 0:
+            yield batch, delay_ms
+            now = admitted
+            batch = []
+        batch.append(length_ms)
+
+
+async def queryer(endpoint, args):
+    import aiohttp
+    import asyncio
+
+    # csv header
+    args.print('Timestamp,LengthUS,LatencyUS,State,EName')
+
+    async with aiohttp.ClientSession() as http_client:
+        # start fetching
+        incoming = incoming_file(args.reqs)
+
+        flying = []
+        base_ms = time.perf_counter() * 1000
+        get_time = lambda: time.perf_counter() * 1000 - base_ms
+        print('INFO: rock and roll', file=sys.stderr)
+        for lengths, delay_ms in incoming:
+            now_ms = get_time()
+
+            lengths_str = ', '.join(['{:.3f}'.format(l) for l in lengths])
+            print(f'INFO: at {now_ms:.3f} ms batch [{lengths_str}] delay {delay_ms:.3f} ms', file=sys.stderr)
+
+            # fire current request
+            if lengths:
+                flying.extend(
+                    asyncio.create_task(fetch(now_ms, length_ms, http_client, endpoint, args))
+                    for length_ms in lengths
+                )
+
+            remaining_ms = delay_ms
+            try:
+                # use remaining time to do some book keeping
+                remaining_ms = delay_ms - (get_time() - now_ms)
+                if remaining_ms > 0 and flying:
+                    # book keeping
+                    done, pending = await asyncio.wait(flying, timeout=0)
+                    flying = list(pending)
+                    # re-raise any exception if debug 
+                    if args.debug:
+                        for r in done:
+                            r.result()
+
+                remaining_ms = delay_ms - (get_time() - now_ms)
+                # wait until delay_ms
+                if remaining_ms > 0:
+                    await asyncio.sleep(remaining_ms / 1000)
+                    remaining_ms = delay_ms - (get_time() - now_ms)
+                else:
+                    if remaining_ms < -5:
+                        print(f'WARNING: bookkeeping for too long: {remaining_ms}ms', file=sys.stderr)
+                        continue
+                if remaining_ms < -5:
+                    print(f'WARNING: slept for too long: {remaining_ms}ms', file=sys.stderr)
+                    continue
+            finally:
+                pass
+        print('INFO: done', file=sys.stderr)
+
+
+async def amain():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="Show response error", default=False)
+    parser.add_argument("--pause", action="store_true", help="pause after setup cluster", default=False)
+    parser.add_argument("--output", type=str, help="Output file", default="output.csv")
+    parser.add_argument("reqs", type=str, help="Request schedule csv file")
+
+    args = parser.parse_args()
+
+    with open(args.output, 'w') as f:
+
+        def printer(*args, **kwargs):
+            print(*args, **{'file': f, **kwargs})
+            f.flush()
+
+        printer('# ' + json.dumps(vars(args)))
+        args.print = printer
+
+        clipper_conn, endpoint = await setup_clipper()
+        if args.pause:
+            try:
+                print('Pausing')
+                input()
+            except KeyboardInterrupt:
+                return
+
+        try:
+            await queryer(endpoint, args)
+        finally:
+            print('INFO: stop clipper')
+            clipper_conn.stop_all()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--request_file", type=str, help="Request schedule csv file", default=None)
-    parser.add_argument("--dur", type=int, help="Duration between posting two request batches, in ms", default=500)
-    parser.add_argument("--min_sleep", type=int, help="Minimum sleep time for a request, in ms", default=50)
-    parser.add_argument("--max_sleep", type=int, help="Maximum sleep time for a request, in ms", default=200)
-    parser.add_argument("--batch_size", type=int, help="Number of requests per batch", default=1)
-    parser.add_argument("--max_batch", type=int, help="Max number of batches to generate", default=10)
-    parser.add_argument("--seed", type=int, help="Input gen seed", default=12345)
-    parser.add_argument("--output_file", type=str, help="Output request csv file", default="output.csv")
-
-    args = parser.parse_args()
-    if args.request_file:
-        req_df = read_csv(args.request_file)
-    else:
-        req_df = gen_requests(args.max_batch, args.batch_size, args.min_sleep, 
-                        args.max_sleep, args.seed, "requests.csv")
-    
-    durs = gen_duration(args.dur, args.max_batch, args.seed)
-
-    asyncio.run(queryer(req_df, durs, args.batch_size, args.output_file))
-
+    import asyncio
+    asyncio.run(amain())
 
 
 if __name__ == '__main__':

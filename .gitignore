@@ -5,6 +5,7 @@
 .ycm_extra_conf.py
 *.pyc
 *.egg-info
+__pycache__
 
 # build directories
 release/
@@ -14,6 +15,7 @@ debug/
 config.log
 target/
 _build/
+build/
 
 # scala
 dependency-reduced-pom.xml
@@ -24,3 +26,4 @@ docker-compose.yml
 
 # model for testing
 model.h5
+output.csv
