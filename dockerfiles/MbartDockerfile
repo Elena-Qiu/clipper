@@ -1,0 +1,24 @@
+ARG REGISTRY=docker.io/clipper
+ARG CODE_VERSION=develop
+FROM ${REGISTRY}/py37-rpc:${CODE_VERSION}
+# FROM docker.io/clipper/py37-rpc:develop
+
+ARG SRC_LANG=en_XX
+ARG DST_LANG=zh_CN
+
+RUN pip install --no-cache-dir --upgrade pip
+# RUN pip install torch -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+RUN pip install --no-cache-dir torch torchvision torchaudio
+RUN pip install --no-cache-dir transformers sentencepiece
+
+COPY containers/mbart/mbart_container.py /container/
+
+ENV HF_HOME=/huggingface
+
+# download and cache models
+RUN python /container/mbart_container.py --src $SRC_LANG --dst $DST_LANG
+
+# force offline when running
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_DATASETS_OFFLINE=1
+CMD ["python", "/container/mbart_container.py", "--rpc", "--src", $SRC_LANG, "--dst", $DST_LANG]
