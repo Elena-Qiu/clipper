@@ -54,7 +54,7 @@ async def setup_clipper(args):
         #     reader = csv.DictReader(f)
         #     first_row = next(reader)
         #     deadline = int(float(first_row['Deadline']) - float(first_row['Admitted']))*1000
-        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=3000000)
+        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=250000)
 
         # wait a few second for the model container to stablize
         await asyncio.sleep(2)
@@ -188,32 +188,34 @@ async def queryer(endpoint, args):
                 )
 
             remaining_ms = delay_ms
-            try:
-                # use remaining time to do some book keeping
-                remaining_ms = delay_ms - (get_time() - now_ms)
-                if remaining_ms > 0 and flying:
-                    # book keeping
-                    done, pending = await asyncio.wait(flying, timeout=0)
-                    flying = list(pending)
-                    # re-raise any exception if debug
-                    if args.debug:
-                        for r in done:
-                            r.result()
-
-                remaining_ms = delay_ms - (get_time() - now_ms)
-                # wait until delay_ms
-                if remaining_ms > 0:
-                    await asyncio.sleep(remaining_ms / 1000)
+            while remaining_ms > 0:
+                try:
+                    # use remaining time to do some book keeping
                     remaining_ms = delay_ms - (get_time() - now_ms)
-                else:
+                    if remaining_ms > 5 and flying:
+                        # book keeping
+                        done, pending = await asyncio.wait(flying, timeout=0.001)
+                        flying = list(pending)
+                        # re-raise any exception if debug
+                        if args.debug:
+                            for r in done:
+                                r.result()
+
+                    remaining_ms = delay_ms - (get_time() - now_ms)
+                    # wait until delay_ms
+                    if remaining_ms > 0:
+                        # wait for 1/5 remaining time
+                        #await asyncio.sleep(remaining_ms / 5 / 1000)
+                        remaining_ms = delay_ms - (get_time() - now_ms)
+                    else:
+                        if remaining_ms < -5:
+                            print(f'WARNING: bookkeeping for too long: {remaining_ms}ms', file=sys.stderr)
+                            continue
                     if remaining_ms < -5:
-                        print(f'WARNING: bookkeeping for too long: {remaining_ms}ms', file=sys.stderr)
+                        print(f'WARNING: slept for too long: {remaining_ms}ms', file=sys.stderr)
                         continue
-                if remaining_ms < -5:
-                    print(f'WARNING: slept for too long: {remaining_ms}ms', file=sys.stderr)
-                    continue
-            finally:
-                pass
+                finally:
+                    pass
         # wait for any flying requests to finish
         done, pending = await asyncio.wait(flying)
         # re-raise any exception if debug
