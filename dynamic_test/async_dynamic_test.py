@@ -28,7 +28,7 @@ def fake_model(batch):
     return output
 
 
-async def setup_clipper():
+async def setup_clipper(args):
     '''Setup the clipper cluster, returns the clipper connection and the endpoint url'''
     import asyncio
     import aiohttp
@@ -49,6 +49,11 @@ async def setup_clipper():
         # deploy the model and register the application
         # this blocks until the model is ready
         name = 'fake-model'
+        # filename = args.reqs
+        # with open(filename) as f:
+        #     reader = csv.DictReader(f)
+        #     first_row = next(reader)
+        #     deadline = int(float(first_row['Deadline']) - float(first_row['Admitted']))*1000
         python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=3000000)
 
         # wait a few second for the model container to stablize
@@ -98,10 +103,13 @@ async def setup_clipper():
 
 
 async def predict(http_client, endpoint, length_ms):
-    async with http_client.post(endpoint, json={'input': [1.0]}) as r:
+    async with http_client.post(endpoint, json={'input': [length_ms]}) as r:
         r = await r.json()
-        length_ms = float(r['output'])
-        return length_ms * 1000
+        if r['output'] is None:
+            return None
+        else:
+            length_ms = float(r['output'])
+            return length_ms * 1000
 
 
 async def fetch(now_ms, length_ms, http_client, endpoint, args):
@@ -115,13 +123,16 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
         length_us = await predict(http_client, endpoint, length_ms)
         # measured latency
         latency_us = (time.perf_counter() - started) * 1000000
-        args.print(f'{now_ms},{length_us},{latency_us},done,')
+        if length_us is None:
+            args.print(f'{now_ms},,{latency_us},past_due,')
+        else:
+            args.print(f'{now_ms},{length_us},{latency_us},done,')
     except Exception as e:
         ename = get_full_class_name(e)
+        args.print(f'{now_ms},,,error,{ename}')
         if args.debug:
             print('Error: ', traceback.format_exc(), file=sys.stderr)
             raise e
-        args.print(f'{now_ms},,,error,{ename}')
 
 
 def incoming_file(filename: str):
@@ -146,6 +157,7 @@ def incoming_file(filename: str):
             now = admitted
             batch = []
         batch.append(length_ms)
+    yield batch, 0
 
 
 async def queryer(endpoint, args):
@@ -158,7 +170,6 @@ async def queryer(endpoint, args):
     async with aiohttp.ClientSession() as http_client:
         # start fetching
         incoming = incoming_file(args.reqs)
-
         flying = []
         base_ms = time.perf_counter() * 1000
         get_time = lambda: time.perf_counter() * 1000 - base_ms
@@ -184,7 +195,7 @@ async def queryer(endpoint, args):
                     # book keeping
                     done, pending = await asyncio.wait(flying, timeout=0)
                     flying = list(pending)
-                    # re-raise any exception if debug 
+                    # re-raise any exception if debug
                     if args.debug:
                         for r in done:
                             r.result()
@@ -203,6 +214,12 @@ async def queryer(endpoint, args):
                     continue
             finally:
                 pass
+        # wait for any flying requests to finish
+        done, pending = await asyncio.wait(flying)
+        # re-raise any exception if debug
+        if args.debug:
+            for r in done:
+                r.result()
         print('INFO: done', file=sys.stderr)
 
 
@@ -226,7 +243,7 @@ async def amain():
         printer('# ' + json.dumps(vars(args)))
         args.print = printer
 
-        clipper_conn, endpoint = await setup_clipper()
+        clipper_conn, endpoint = await setup_clipper(args)
         if args.pause:
             try:
                 print('Pausing')
