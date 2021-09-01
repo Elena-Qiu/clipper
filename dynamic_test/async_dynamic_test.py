@@ -22,7 +22,12 @@ def fake_model(batch):
     latency_ms = max(sample[0] for sample in batch)
     # copy input to output
     output = [str(sample[0]) for sample in batch]
-    time.sleep(latency_ms / 1000)
+
+    # sleep
+    now = time.perf_counter()
+    target = now + latency_ms / 1000
+    while time.perf_counter() < target:
+        pass
 
     print('fake_model: returning', output)
     return output
@@ -42,19 +47,14 @@ async def setup_clipper(args):
         # start or connect to the cluster
         try:
             # this blocks until the cluster is ready
-            clipper_conn.start_clipper()
+            clipper_conn.start_clipper(cache_size=0)
         except ClipperException:
             clipper_conn.connect()
 
         # deploy the model and register the application
         # this blocks until the model is ready
         name = 'fake-model'
-        # filename = args.reqs
-        # with open(filename) as f:
-        #     reader = csv.DictReader(f)
-        #     first_row = next(reader)
-        #     deadline = int(float(first_row['Deadline']) - float(first_row['Admitted']))*1000
-        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=250000)
+        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=args.slo_us, batch_size=args.batch_size)
 
         # wait a few second for the model container to stablize
         await asyncio.sleep(2)
@@ -125,6 +125,8 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
         latency_us = (time.perf_counter() - started) * 1000000
         if length_us is None:
             args.print(f'{now_ms},,{latency_us},past_due,')
+        elif latency_us > args.slo_us:
+            args.print(f'{now_ms},{length_us},{latency_us},past_due,')
         else:
             args.print(f'{now_ms},{length_us},{latency_us},done,')
     except Exception as e:
@@ -232,6 +234,9 @@ async def amain():
     parser.add_argument("--debug", action="store_true", help="Show response error", default=False)
     parser.add_argument("--pause", action="store_true", help="pause after setup cluster", default=False)
     parser.add_argument("--output", type=str, help="Output file", default="output.csv")
+    parser.add_argument("--slo_us", type=int, help="SLO in microseconds", default=250000)
+    parser.add_argument("--batch_size", type=int, help="max batch size", default=16)
+
     parser.add_argument("reqs", type=str, help="Request schedule csv file")
 
     args = parser.parse_args()
@@ -255,6 +260,7 @@ async def amain():
 
         try:
             await queryer(endpoint, args)
+            clipper_conn.get_clipper_logs('output/logs/')
         finally:
             print('INFO: stop clipper')
             clipper_conn.stop_all()
