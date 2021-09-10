@@ -160,7 +160,7 @@ def incoming_file(filename: str):
     yields (delay_ms, length_ms)
     """
     with open(filename) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(row for row in f if not row.startswith('#'))
         jobs = [
             (float(row['Admitted']), float(row['Length']))
             for row in reader
