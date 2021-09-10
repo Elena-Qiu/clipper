@@ -149,7 +149,7 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
             args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
     except Exception as e:
         ename = get_full_class_name(e)
-        args.print(f'{now_ms},,,error,Internal,{ename},')
+        args.print(f'{now_ms},,,error,Internal,{ename}')
         if args.debug:
             print('Error: ', traceback.format_exc(), file=sys.stderr)
             raise e
