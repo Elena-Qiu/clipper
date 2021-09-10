@@ -140,13 +140,13 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
         latency_us = (time.perf_counter() - started) * 1000000
 
         # output csv
-        if latency_us > args.slo_us:
-            args.print(f'{now_ms},{reply.length_us},{latency_us},past_due,{reply.error_kind},{reply.error_msg}')
-        else:
-            if reply.ok:
-                args.print(f'{now_ms},{reply.length_us},{latency_us},done,,')
+        if reply.ok:
+            if latency_us > args.slo_us:
+                args.print(f'{now_ms},{reply.length_us},{latency_us},past_due_client,{reply.error_kind},{reply.error_msg}')
             else:
-                args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
+                args.print(f'{now_ms},{reply.length_us},{latency_us},done,,')
+        else:
+            args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
     except Exception as e:
         ename = get_full_class_name(e)
         args.print(f'{now_ms},,,error,Internal,{ename},')
