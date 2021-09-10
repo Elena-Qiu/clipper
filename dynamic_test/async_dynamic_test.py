@@ -5,6 +5,7 @@ import time
 import traceback
 import json
 import csv
+from typing import NamedTuple, Optional
 
 
 def get_full_class_name(obj):
@@ -102,14 +103,28 @@ async def setup_clipper(args):
         raise e
 
 
+class ClipperReply(NamedTuple):
+    ok: bool
+    status: int
+    length_us: Optional[float] = None
+    error_kind: Optional[str] = None
+    error_msg: Optional[str] = None
+
+
 async def predict(http_client, endpoint, length_ms):
     async with http_client.post(endpoint, json={'input': [length_ms]}) as r:
-        r = await r.json()
-        if r['output'] is None:
-            return None
+        body = await r.json()
+        if r.ok:
+            try:
+                got_length_us = float(body['output'])
+                if got_length_us - length_ms * 1000.0 > 10000000:
+                    print(f'WARNING: fetching {length_ms:.3f} ms but got {got_length_us:.3f} us', file=sys.stderr)
+                    got_length_us = length_ms * 1000.0
+            except Exception:
+                got_length_us = length_ms * 1000.0
+            return ClipperReply(r.ok, r.status, got_length_us, None, None)
         else:
-            length_ms = float(r['output'])
-            return length_ms * 1000
+            return ClipperReply(r.ok, r.status, length_ms * 1000.0, body['error'], body['cause'])
 
 
 async def fetch(now_ms, length_ms, http_client, endpoint, args):
@@ -120,18 +135,21 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
             print(f'INFO: at {now_ms:.3f} ms fetching None ms', file=sys.stderr)
 
         started = time.perf_counter()
-        length_us = await predict(http_client, endpoint, length_ms)
+        reply = await predict(http_client, endpoint, length_ms)
         # measured latency
         latency_us = (time.perf_counter() - started) * 1000000
-        if length_us is None:
-            args.print(f'{now_ms},,{latency_us},past_due,')
-        elif latency_us > args.slo_us:
-            args.print(f'{now_ms},{length_us},{latency_us},past_due,')
+
+        # output csv
+        if latency_us > args.slo_us:
+            args.print(f'{now_ms},{reply.length_us},{latency_us},past_due,{reply.error_kind},{reply.error_msg}')
         else:
-            args.print(f'{now_ms},{length_us},{latency_us},done,')
+            if reply.ok:
+                args.print(f'{now_ms},{reply.length_us},{latency_us},done,,')
+            else:
+                args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
     except Exception as e:
         ename = get_full_class_name(e)
-        args.print(f'{now_ms},,,error,{ename}')
+        args.print(f'{now_ms},,,error,Internal,{ename},')
         if args.debug:
             print('Error: ', traceback.format_exc(), file=sys.stderr)
             raise e
@@ -167,7 +185,7 @@ async def queryer(endpoint, args):
     import asyncio
 
     # csv header
-    args.print('Timestamp,LengthUS,LatencyUS,State,EName')
+    args.print('Timestamp,LengthUS,LatencyUS,State,EName,ECause')
 
     async with aiohttp.ClientSession() as http_client:
         # start fetching
