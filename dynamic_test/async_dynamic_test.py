@@ -22,7 +22,7 @@ def fake_model(batch):
     # the runtime of a batch is max(batch)
     latency_ms = max(sample[0] for sample in batch)
     # copy input to output
-    output = [str(sample[0]) for sample in batch]
+    output = [str(sample) for sample in batch]
 
     # sleep
     now = time.perf_counter()
