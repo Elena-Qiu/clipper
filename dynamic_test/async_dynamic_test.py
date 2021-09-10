@@ -251,7 +251,7 @@ async def amain():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="Show response error", default=False)
     parser.add_argument("--pause", action="store_true", help="pause after setup cluster", default=False)
-    parser.add_argument("--output", type=str, help="Output file", default="output.csv")
+    parser.add_argument("--output", type=str, help="Output directory", default="output")
     parser.add_argument("--slo_us", type=int, help="SLO in microseconds", default=250000)
     parser.add_argument("--batch_size", type=int, help="max batch size", default=16)
 
@@ -259,7 +259,7 @@ async def amain():
 
     args = parser.parse_args()
 
-    with open(args.output, 'w') as f:
+    with open(args.output + '/output.csv', 'w') as f:
 
         def printer(*args, **kwargs):
             print(*args, **{'file': f, **kwargs})
@@ -278,7 +278,7 @@ async def amain():
 
         try:
             await queryer(endpoint, args)
-            clipper_conn.get_clipper_logs('output/logs/')
+            clipper_conn.get_clipper_logs(args.output + '/logs/')
         finally:
             print('INFO: stop clipper')
             clipper_conn.stop_all()
