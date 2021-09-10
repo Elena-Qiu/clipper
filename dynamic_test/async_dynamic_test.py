@@ -117,7 +117,7 @@ async def predict(http_client, endpoint, length_ms):
         if r.ok:
             try:
                 got_length_us = float(body['output'])
-                if got_length_us - length_ms * 1000.0 > 10000000:
+                if abs(got_length_us - length_ms * 1000.0) > 1000:
                     print(f'WARNING: fetching {length_ms:.3f} ms but got {got_length_us:.3f} us', file=sys.stderr)
                     got_length_us = length_ms * 1000.0
             except Exception:
