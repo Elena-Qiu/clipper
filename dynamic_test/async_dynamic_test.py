@@ -28,7 +28,7 @@ def fake_model(batch):
     return output
 
 
-async def setup_clipper():
+async def setup_clipper(args):
     '''Setup the clipper cluster, returns the clipper connection and the endpoint url'''
     import asyncio
     import aiohttp
@@ -49,7 +49,7 @@ async def setup_clipper():
         # deploy the model and register the application
         # this blocks until the model is ready
         name = 'fake-model'
-        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=3000000)
+        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=args.slo_ms * 1000)
 
         # wait a few second for the model container to stablize
         await asyncio.sleep(2)
@@ -98,30 +98,38 @@ async def setup_clipper():
 
 
 async def predict(http_client, endpoint, length_ms):
-    async with http_client.post(endpoint, json={'input': [1.0]}) as r:
+    async with http_client.post(endpoint, json={'input': [length_ms]}) as r:
         r = await r.json()
-        length_ms = float(r['output'])
-        return length_ms * 1000
+        if r['output'] is None:
+            return None
+        else:
+            length_ms = float(r['output'])
+            return length_ms * 1000
 
 
-async def fetch(now_ms, length_ms, http_client, endpoint, args):
-    try:
-        if length_ms is not None:
-            print(f'INFO: at {now_ms:.3f} ms fetching {length_ms:.3f} ms', file=sys.stderr)
+async def fetch(base_ms, jobid_length_ms, http_client, endpoint, args):
+        get_time = lambda: time.perf_counter() * 1000 - base_ms
+        now_ms = get_time()
+        if jobid_length_ms is not None:
+            try:
+                jobid, length_ms = jobid_length_ms
+                print(f'INFO: at {now_ms:.3f} ms fetching ({jobid}, {length_ms:.3f}ms)', file=sys.stdout)
+                started = get_time()
+                length_us = await predict(http_client, endpoint, length_ms)
+                # measured latency
+                latency_us = (get_time() - started) * 1000
+                if latency_us is None:
+                    args.print(f'{jobid},{started},,,past_due,')
+                else:
+                    args.print(f'{jobid},{started},{length_us},{latency_us},done,')
+            except Exception as e:
+                ename = get_full_class_name(e)
+                args.print(f'{jobid},{started},,,error,{ename}')
+                if args.debug:
+                    print('Error: ', traceback.format_exc(), file=sys.stderr)
+                    raise e
         else:
             print(f'INFO: at {now_ms:.3f} ms fetching None ms', file=sys.stderr)
-
-        started = time.perf_counter()
-        length_us = await predict(http_client, endpoint, length_ms)
-        # measured latency
-        latency_us = (time.perf_counter() - started) * 1000000
-        args.print(f'{now_ms},{length_us},{latency_us},done,')
-    except Exception as e:
-        ename = get_full_class_name(e)
-        if args.debug:
-            print('Error: ', traceback.format_exc(), file=sys.stderr)
-            raise e
-        args.print(f'{now_ms},,,error,{ename}')
 
 
 def incoming_file(filename: str):
@@ -131,21 +139,20 @@ def incoming_file(filename: str):
     with open(filename) as f:
         reader = csv.DictReader(f)
         jobs = [
-            (float(row['Admitted']), float(row['Length']))
+            (int(row['JobId']),float(row['Admitted']), float(row['Length']))
             for row in reader
         ]
     # jobs has to be sort by admitted
     jobs.sort()
     # take note of current time
-    now = 0
+    last_admitted = jobs[0][0] - 1
     batch = []
-    for admitted, length_ms in jobs:
-        delay_ms = admitted - now
-        if delay_ms > 0:
-            yield batch, delay_ms
-            now = admitted
+    for jobid, admitted, length_ms in jobs:
+        batch.append((jobid,length_ms))
+        if admitted > last_admitted:
+            yield batch, admitted
+            last_admitted = admitted
             batch = []
-        batch.append(length_ms)
 
 
 async def queryer(endpoint, args):
@@ -153,56 +160,42 @@ async def queryer(endpoint, args):
     import asyncio
 
     # csv header
-    args.print('Timestamp,LengthUS,LatencyUS,State,EName')
+    args.print('JobId,Timestamp,LengthUS,LatencyUS,State,EName')
 
     async with aiohttp.ClientSession() as http_client:
         # start fetching
         incoming = incoming_file(args.reqs)
-
-        flying = []
         base_ms = time.perf_counter() * 1000
         get_time = lambda: time.perf_counter() * 1000 - base_ms
+        flying = []
         print('INFO: rock and roll', file=sys.stderr)
-        for lengths, delay_ms in incoming:
+        for jobid_lengths, admitted_ms in incoming:
             now_ms = get_time()
-
-            lengths_str = ', '.join(['{:.3f}'.format(l) for l in lengths])
-            print(f'INFO: at {now_ms:.3f} ms batch [{lengths_str}] delay {delay_ms:.3f} ms', file=sys.stderr)
-
-            # fire current request
-            if lengths:
-                flying.extend(
-                    asyncio.create_task(fetch(now_ms, length_ms, http_client, endpoint, args))
-                    for length_ms in lengths
-                )
-
-            remaining_ms = delay_ms
-            try:
-                # use remaining time to do some book keeping
-                remaining_ms = delay_ms - (get_time() - now_ms)
-                if remaining_ms > 0 and flying:
-                    # book keeping
-                    done, pending = await asyncio.wait(flying, timeout=0)
-                    flying = list(pending)
-                    # re-raise any exception if debug 
-                    if args.debug:
-                        for r in done:
-                            r.result()
-
-                remaining_ms = delay_ms - (get_time() - now_ms)
-                # wait until delay_ms
+            lengths_str = ', '.join(['({}, {:.3f})'.format(l[0],l[1]) for l in jobid_lengths])
+            print(f'INFO: at {now_ms:.3f} ms batch [{lengths_str}] admitted at {admitted_ms:.3f} ms', file=sys.stderr)
+            if jobid_lengths:
+                # wait until the admitted time
+                remaining_ms = admitted_ms - get_time()
                 if remaining_ms > 0:
                     await asyncio.sleep(remaining_ms / 1000)
-                    remaining_ms = delay_ms - (get_time() - now_ms)
-                else:
+                    remaining_ms = admitted_ms - get_time()
                     if remaining_ms < -5:
-                        print(f'WARNING: bookkeeping for too long: {remaining_ms}ms', file=sys.stderr)
-                        continue
-                if remaining_ms < -5:
-                    print(f'WARNING: slept for too long: {remaining_ms}ms', file=sys.stderr)
-                    continue
-            finally:
-                pass
+                        print(f'WARNING: slept for too long: {remaining_ms}ms', file=sys.stderr)
+                elif remaining_ms < -5:
+                    print(f'WARNING: bookkeeping for too long: {remaining_ms}ms', file=sys.stderr)
+
+                now_ms = get_time()
+                if jobid_lengths:
+                    flying.extend(
+                        asyncio.create_task(fetch(base_ms, jobid_length_ms, http_client, endpoint, args))
+                        for jobid_length_ms in jobid_lengths
+                    )
+                done, pending = await asyncio.wait(flying, timeout=0)
+                print("INFO: Pending Length is {}".format(len(pending)))
+                flying = list(pending)
+                if args.debug:
+                    for r in done:
+                        r.result()
         print('INFO: done', file=sys.stderr)
 
 
@@ -212,8 +205,9 @@ async def amain():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="Show response error", default=False)
     parser.add_argument("--pause", action="store_true", help="pause after setup cluster", default=False)
+    parser.add_argument("--slo_ms", type=int, help="slo in milliseconds")
     parser.add_argument("--output", type=str, help="Output file", default="output.csv")
-    parser.add_argument("reqs", type=str, help="Request schedule csv file")
+    parser.add_argument("--reqs", type=str, help="Request schedule csv file", default="reqs.csv")
 
     args = parser.parse_args()
 
@@ -222,11 +216,12 @@ async def amain():
         def printer(*args, **kwargs):
             print(*args, **{'file': f, **kwargs})
             f.flush()
+        
 
         printer('# ' + json.dumps(vars(args)))
         args.print = printer
 
-        clipper_conn, endpoint = await setup_clipper()
+        clipper_conn, endpoint = await setup_clipper(args)
         if args.pause:
             try:
                 print('Pausing')
