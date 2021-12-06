@@ -152,7 +152,7 @@ async def setup_clipper(args):
         return clipper_conn, endpoint
     except Exception as e:
         # cleanup if error
-        print('ERROR: error when starting clipper, clean up', file=sys.stderr)
+        print('ERROR: error when starting clipper, clean up before bubble up the error: {}'.format(get_full_class_name(e)), file=sys.stderr)
         clipper_conn.stop_all()
         raise e
 
@@ -174,8 +174,8 @@ async def predict(http_client, endpoint, length_ms):
                 if abs(got_length_ms - length_ms) > 1000:
                     print(f'WARNING: fetching {length_ms:.3f} ms but got {got_length_ms:.3f} us', file=sys.stderr)
             except Exception:
-                got_length_us = length_ms * 1000.0
-            return ClipperReply(r.ok, r.status, got_length_us, None, None)
+                return ClipperReply(False, r.status, length_ms * 1000.0, 'past_due', body['output'])
+            return ClipperReply(r.ok, r.status, got_length_ms * 1000.0, None, None)
         else:
             return ClipperReply(r.ok, r.status, length_ms * 1000.0, body['error'], body['cause'])
 
@@ -199,7 +199,10 @@ async def fetch(now_ms, length_ms, http_client, endpoint, args):
             else:
                 args.print(f'{now_ms},{reply.length_us},{latency_us},done,,')
         else:
-            args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
+            if reply.error_kind == 'past_due':
+                args.print(f'{now_ms},{reply.length_us},{latency_us},past_due,,')
+            else:
+                args.print(f'{now_ms},{reply.length_us},{latency_us},error,{reply.error_kind},{reply.error_msg}')
     except Exception as e:
         ename = get_full_class_name(e)
         args.print(f'{now_ms},,,error,Internal,{ename}')
