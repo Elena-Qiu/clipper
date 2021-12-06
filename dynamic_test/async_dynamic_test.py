@@ -82,12 +82,14 @@ async def setup_clipper(args):
             retry = 10
             while retry > 0:
                 try:
-                    await predict(http_client, endpoint, 1.0)
-                    break
+                    res = await predict(http_client, endpoint, 1.0)
+                    if res.ok:
+                        break
                 except:
-                    print('INFO: waiting for ready to serve', file=sys.stderr)
-                    await asyncio.sleep(1)
-                    retry -= 1
+                    pass
+                print('INFO: waiting for ready to serve', file=sys.stderr)
+                await asyncio.sleep(1)
+                retry -= 1
             else:
                 # something wrong
                 print('ERROR: replicas take too long to spin up, possibly died. Check container log', file=sys.stderr)
