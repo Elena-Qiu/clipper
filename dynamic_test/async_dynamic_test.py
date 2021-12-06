@@ -5,7 +5,7 @@ import time
 import traceback
 import json
 import csv
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple, List
 
 
 def get_full_class_name(obj):
@@ -15,14 +15,17 @@ def get_full_class_name(obj):
     return module + '.' + obj.__class__.__name__
 
 
-def fake_model(batch):
+def fake_model(c1, batch):
     '''Model runs inside clipper, not async'''
-    print('fake_model: serving batch', batch)
+    # the runtime of a batch is max(batch) * c1 + c0
+    max_latency_in_batch = max(sample[0] for sample in batch)
+    c0 = max_latency_in_batch - c1 * max_latency_in_batch
+    latency_ms = c0 + c1 * len(batch) * max_latency_in_batch
 
-    # the runtime of a batch is max(batch)
-    latency_ms = max(sample[0] for sample in batch)
-    # copy input to output
-    output = [str(sample) for sample in batch]
+    print('fake_model: serving batch {}, sleeping for {:.2f}ms = {:.2f} + {:.2f} * {} * {:.2f}'.format(batch, latency_ms, c0, c1, len(batch), max_latency_in_batch))
+
+    # copy first input to output
+    output = [sample[0] for sample in batch]
 
     # sleep
     now = time.perf_counter()
@@ -32,6 +35,50 @@ def fake_model(batch):
 
     print('fake_model: returning', output)
     return output
+
+
+def simple_linear_regression(data: List[Tuple[int, float]]) -> Tuple[float, float]:
+    n_real = len(data)
+    sum_x = 0.0
+    sum_xx = 0.0
+    sum_xy = 0.0
+    sum_y = 0.0
+    sum_yy = 0.0
+    for x, y in data:
+        sum_x += x
+        sum_xx += x * x
+        sum_xy += x * y
+        sum_y += y
+        sum_yy += y * y
+
+    denominator = n_real * sum_xx - sum_x * sum_x
+    slope = (n_real * sum_xy - sum_x * sum_y) / denominator
+    intercept = (sum_y - slope * sum_x) / n_real
+
+    return intercept, slope
+
+
+def compute_batch(args):
+    with open(args.latencies) as f:
+        reader = csv.DictReader(row for row in f if not row.startswith('#'))
+        data = [
+            (int(row['BatchSize']), float(row['InferenceLatency']))
+            for row in reader
+        ]
+    b = 0
+    e = next(idx for idx, (x, _) in enumerate(data) if x > args.batch_size)
+
+    c0, c1 = simple_linear_regression(data[b:e])
+    c1 = c1 / (c0 + c1)
+    while c1 < 0:
+        # try again without the first entry, which may be inaccurate
+        b += 1
+        e = min(e + 1, len(data))
+        assert b < e, "bogus latencies!"
+        c0, c1 = simple_linear_regression(data[b:e])
+        c1 = c1 / (c0 + c1)
+    assert c1 >= 0, "batch overhead slope is negative?!"
+    return c1
 
 
 async def setup_clipper(args):
@@ -55,7 +102,12 @@ async def setup_clipper(args):
         # deploy the model and register the application
         # this blocks until the model is ready
         name = 'fake-model'
-        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model, slo_micros=args.slo_us, batch_size=args.batch_size)
+        c1 = compute_batch(args)
+
+        def fake_model_wrapper(args):
+            return fake_model(c1, args)
+
+        python_deployer.create_endpoint(clipper_conn, name, "floats", fake_model_wrapper, slo_micros=args.slo_us, batch_size=args.batch_size)
 
         # wait a few second for the model container to stablize
         await asyncio.sleep(2)
@@ -118,10 +170,9 @@ async def predict(http_client, endpoint, length_ms):
         body = await r.json()
         if r.ok:
             try:
-                got_length_us = float(body['output'])
-                if abs(got_length_us - length_ms * 1000.0) > 1000:
-                    print(f'WARNING: fetching {length_ms:.3f} ms but got {got_length_us:.3f} us', file=sys.stderr)
-                    got_length_us = length_ms * 1000.0
+                got_length_ms = float(body['output'])
+                if abs(got_length_ms - length_ms) > 1000:
+                    print(f'WARNING: fetching {length_ms:.3f} ms but got {got_length_ms:.3f} us', file=sys.stderr)
             except Exception:
                 got_length_us = length_ms * 1000.0
             return ClipperReply(r.ok, r.status, got_length_us, None, None)
@@ -258,6 +309,7 @@ async def amain():
     parser.add_argument("--batch_size", type=int, help="max batch size", default=16)
 
     parser.add_argument("reqs", type=str, help="Request schedule csv file")
+    parser.add_argument("latencies", type=str, help="Batch latencies csv file")
 
     args = parser.parse_args()
 
